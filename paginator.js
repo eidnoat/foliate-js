@@ -65,7 +65,7 @@ const SCROLL_RELOCATE_MAX_WAIT = 1000
 // Transforms ALL children of the container so multi-view layouts
 // animate as a unified whole. Extra elements (e.g. background) are
 // also transformed so they slide in sync with the content.
-const cssAnimateScroll = (element, scrollProp, startValue, endValue, duration, extraElements = []) => new Promise(resolve => {
+const cssAnimateScroll = (element, scrollProp, startValue, endValue, duration, extraElements = [], onReadyCancel) => new Promise(resolve => {
     if (document.hidden) {
         element[scrollProp] = endValue
         return resolve()
@@ -99,9 +99,13 @@ const cssAnimateScroll = (element, scrollProp, startValue, endValue, duration, e
     }
 
     let resolved = false
-    const cleanup = () => {
+    const first = children[0]
+    let timeoutId
+    const cleanup = (sync = false) => {
         if (resolved) return
         resolved = true
+        if (timeoutId) clearTimeout(timeoutId)
+        first.removeEventListener('transitionend', onTransitionEnd)
 
         for (const el of allElements) {
             el.style.willChange = ''
@@ -118,7 +122,7 @@ const cssAnimateScroll = (element, scrollProp, startValue, endValue, duration, e
         // beyond the target and is invisible; on the last page of the book,
         // where the target *is* the maximum scroll offset, it lands a full page
         // short and the page visibly snaps back (readest#5663).
-        if (Math.abs(element[scrollProp] - endValue) > 0.5) {
+        if (!sync && Math.abs(element[scrollProp] - endValue) > 0.5) {
             // Forcing a layout here is not enough — the extent it reports is
             // restored, but the scroll clamp still uses the stale one for the
             // rest of the task. The next frame is past the compositor's
@@ -132,18 +136,18 @@ const cssAnimateScroll = (element, scrollProp, startValue, endValue, duration, e
         resolve()
     }
 
+    onReadyCancel?.(() => cleanup(true))
+
     // Listen for transition end on the first child
-    const first = children[0]
     const onTransitionEnd = (e) => {
         if (e.target === first && e.propertyName === 'transform') {
-            first.removeEventListener('transitionend', onTransitionEnd)
             cleanup()
         }
     }
     first.addEventListener('transitionend', onTransitionEnd)
 
     // Fallback timeout in case transitionend doesn't fire
-    setTimeout(cleanup, duration + 50)
+    timeoutId = setTimeout(cleanup, duration + 50)
 })
 
 // Two-phase page-turn slide for vertical (vertical-rl/lr) paginated books.
@@ -392,24 +396,32 @@ const easeOutQuad = x => 1 - (1 - x) * (1 - x)
 // CSS-transform animate, this never composites the whole section as a
 // single layer, so it doesn't block when the section exceeds the GPU texture
 // limit — it just changes scroll offset each frame (incremental/tiled).
-const rafAnimateScroll = (a, b, duration, ease, render) => new Promise(resolve => {
+const rafAnimateScroll = (a, b, duration, ease, render, onReadyCancel) => new Promise(resolve => {
     let start
+    let rafId
+    let resolved = false
+    const finish = () => {
+        if (resolved) return
+        resolved = true
+        if (rafId) cancelAnimationFrame(rafId)
+        render(lerp(a, b, 1))
+        resolve()
+    }
+    onReadyCancel?.(finish)
     const step = now => {
-        if (document.hidden) {
-            render(lerp(a, b, 1))
-            return resolve()
-        }
+        if (resolved) return
+        if (document.hidden) return finish()
         start ??= now
         const fraction = Math.min(1, (now - start) / duration)
         render(lerp(a, b, ease(fraction)))
-        if (fraction < 1) requestAnimationFrame(step)
-        else resolve()
+        if (fraction < 1) rafId = requestAnimationFrame(step)
+        else {
+            resolved = true
+            resolve()
+        }
     }
-    if (document.hidden) {
-        render(lerp(a, b, 1))
-        return resolve()
-    }
-    requestAnimationFrame(step)
+    if (document.hidden) return finish()
+    rafId = requestAnimationFrame(step)
 })
 
 // A CSS-transform page-turn must composite the whole section as one layer. Once
@@ -1550,6 +1562,7 @@ export class Paginator extends HTMLElement {
     #scrollLocked = false
     #subpixelOffset = 0
     #isAnimating = false
+    #finishScrollAnim = null
     // Generation counter for slideTurnAnimation: a newer vertical page turn
     // bumps it so an in-flight two-phase slide stops touching the DOM.
     #slideTurnId = 0
@@ -3457,10 +3470,18 @@ export class Paginator extends HTMLElement {
             // cssAnimateScroll path even for large sections (readest#4768).
             if (!this.hasAttribute('gpu-composite')
                 && this.#renderedViewSize > RAF_ANIMATE_SCROLL_THRESHOLD) {
-                return rafAnimateScroll(startPosition, offset, 300, easeOutQuad, x => {
-                    this.#container[this.scrollProp] = x
-                    if (!this.scrolled) this.#replaceBackground()
-                }).then(() => {
+                return rafAnimateScroll(
+                    startPosition,
+                    offset,
+                    300,
+                    easeOutQuad,
+                    x => {
+                        this.#container[this.scrollProp] = x
+                        if (!this.scrolled) this.#replaceBackground()
+                    },
+                    cancel => { this.#finishScrollAnim = cancel },
+                ).then(() => {
+                    this.#finishScrollAnim = null
                     this.#isAnimating = false
                     this.#bgAnimContext = null
                     this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
@@ -3494,7 +3515,10 @@ export class Paginator extends HTMLElement {
                 startPosition,
                 offset,
                 300,
+                [],
+                cancel => { this.#finishScrollAnim = cancel },
             ).then(() => {
+                this.#finishScrollAnim = null
                 this.#isAnimating = false
                 this.#bgAnimContext = null
                 this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
@@ -4271,6 +4295,14 @@ export class Paginator extends HTMLElement {
     async #turnPage(dir, distance) {
         const nativeCommit = this.hasAttribute('data-native-paper-commit')
         if (this.#pagePreview) await this.#pagePreview
+        // If a previous non-layered push/scroll animation is still in flight,
+        // fast-forward it to its destination and let its promise microtasks
+        // release #locked so rapid consecutive swipes or key presses are not dropped.
+        if (this.#locked && this.#finishScrollAnim) {
+            this.#finishScrollAnim()
+            await Promise.resolve()
+            await Promise.resolve()
+        }
         if (this.#locked) return
         this.#locked = true
         const prev = dir === -1
